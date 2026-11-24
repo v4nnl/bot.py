@@ -1741,12 +1741,12 @@ async def on_message_delete(message):
     cfg = get_cfg(message.guild.id)
     if not cfg.get("log_channel"):
         return
-    content = (message.content or "*[нет текста / вложение или эмбед]*")[:1000]
+    content = (message.content or "*[No Text/ Attachment Or Embed]*")[:1000]
     e = emb(
-        "🗑️ Сообщение удалено",
-        f"**Автор:** {message.author.mention} (`{message.author.id}`)\n"
-        f"**Канал:** {message.channel.mention}\n"
-        f"**Текст:**\n{discord.utils.escape_mentions(content)}",
+        "🗑️ Message Deleted",
+        f"**Author:** {message.author.mention} (`{message.author.id}`)\n"
+        f"**Channel:** {message.channel.mention}\n"
+        f"**Text:**\n{discord.utils.escape_mentions(content)}",
         RED,
     )
     await modlog(message.guild, e)
@@ -1761,14 +1761,14 @@ async def on_message_edit(before, after):
     cfg = get_cfg(after.guild.id)
     if not cfg.get("log_channel"):
         return
-    old_txt = (before.content or "*[пусто]*")[:900]
-    new_txt = (after.content or "*[пусто]*")[:900]
+    old_txt = (before.content or "*[Empty]*")[:900]
+    new_txt = (after.content or "*[Empty]*")[:900]
     e = emb(
-        "✏️ Сообщение изменено",
-        f"**Автор:** {after.author.mention} (`{after.author.id}`)\n"
-        f"**Канал:** {after.channel.mention} ([перейти]({after.jump_url}))\n"
-        f"**Было:**\n{discord.utils.escape_mentions(old_txt)}\n\n"
-        f"**Стало:**\n{discord.utils.escape_mentions(new_txt)}",
+        "Message Edited",
+        f"**Author:** {after.author.mention} (`{after.author.id}`)\n"
+        f"**Channel:** {after.channel.mention} ([Move to]({after.jump_url}))\n"
+        f"**Before:**\n{discord.utils.escape_mentions(old_txt)}\n\n"
+        f"**Afte:**\n{discord.utils.escape_mentions(new_txt)}",
         GOLD,
     )
     await modlog(after.guild, e)
@@ -1781,11 +1781,11 @@ async def on_member_remove(member):
     if not cfg.get("log_channel"):
         return
     roles = [r.mention for r in member.roles if r != guild.default_role]
-    roles_txt = ", ".join(roles[:15]) if roles else "нет"
+    roles_txt = ", ".join(roles[:15]) if roles else "Nope"
     e = emb(
-        "🚪 Участник вышел / удалён",
-        f"**Пользователь:** {member} (`{member.id}`)\n"
-        f"**Роли:** {roles_txt}",
+        "🚪 Member Left / deleted from the server",
+        f"**User:** {member} (`{member.id}`)\n"
+        f"**Roles:** {roles_txt}",
         BLURPLE,
     )
     await modlog(guild, e)
