@@ -166,6 +166,199 @@ def _save_json(path, data):
     os.replace(tmp, path)
 
 
+
+
+# ---------------- HollyScriptX local verification storage ----------------
+# No external HollyScriptX API/webhook was supplied, so these records are local.
+HSX_DB = DATA_DIR / "hollyscriptx.sqlite3"
+
+
+def hsx_db():
+    con = sqlite3.connect(HSX_DB)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def hsx_init_db():
+    with hsx_db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS hsx_config (
+            guild_id INTEGER PRIMARY KEY,
+            verify_channel_id INTEGER,
+            verified_role_id INTEGER,
+            pending_role_id INTEGER,
+            feedback_channel_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS hsx_users (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unverified',
+            updated_at INTEGER NOT NULL,
+            updated_by INTEGER,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS hsx_blacklist (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            added_by INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS hsx_bypasses (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            granted_by INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS hsx_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS hsx_vouches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(guild_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS hsx_requests (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        """)
+        con.commit()
+
+
+def hsx_config(guild_id):
+    with hsx_db() as con:
+        row = con.execute("SELECT * FROM hsx_config WHERE guild_id=?", (guild_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def hsx_set_status(guild_id, user_id, status, actor_id=None):
+    with hsx_db() as con:
+        con.execute("""
+            INSERT INTO hsx_users(guild_id,user_id,status,updated_at,updated_by)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                status=excluded.status, updated_at=excluded.updated_at,
+                updated_by=excluded.updated_by
+        """, (guild_id, user_id, status, int(time.time()), actor_id))
+        con.commit()
+
+
+def hsx_status(guild_id, user_id):
+    with hsx_db() as con:
+        row = con.execute(
+            "SELECT status FROM hsx_users WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+    return row["status"] if row else "unverified"
+
+
+def hsx_is_blacklisted(guild_id, user_id):
+    with hsx_db() as con:
+        return con.execute(
+            "SELECT 1 FROM hsx_blacklist WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone() is not None
+
+
+def hsx_has_bypass(guild_id, user_id):
+    current = int(time.time())
+    with hsx_db() as con:
+        row = con.execute(
+            "SELECT expires_at FROM hsx_bypasses WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+        if row and row["expires_at"] <= current:
+            con.execute(
+                "DELETE FROM hsx_bypasses WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)
+            )
+            con.commit()
+            return False
+        return bool(row)
+
+
+async def hsx_apply_roles(member):
+    cfg = hsx_config(member.guild.id)
+    verified = member.guild.get_role(cfg.get("verified_role_id")) if cfg.get("verified_role_id") else None
+    pending = member.guild.get_role(cfg.get("pending_role_id")) if cfg.get("pending_role_id") else None
+    status = hsx_status(member.guild.id, member.id)
+    if hsx_has_bypass(member.guild.id, member.id):
+        status = "bypass"
+
+    if status in ("verified", "bypass"):
+        if verified and verified not in member.roles:
+            await member.add_roles(verified, reason="HollyScriptX verification role sync")
+        if pending and pending in member.roles:
+            await member.remove_roles(pending, reason="HollyScriptX verification role sync")
+    else:
+        if verified and verified in member.roles:
+            await member.remove_roles(verified, reason="HollyScriptX verification role sync")
+        if pending and pending not in member.roles:
+            await member.add_roles(pending, reason="HollyScriptX verification role sync")
+
+
+class HollyScriptXVerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Request verification",
+        style=discord.ButtonStyle.primary,
+        custom_id="hollyscriptx:request_verification"
+    )
+    async def request_verification(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                "This button can only be used in a server.", ephemeral=True
+            )
+
+        gid, uid = interaction.guild.id, interaction.user.id
+        if hsx_is_blacklisted(gid, uid):
+            return await interaction.response.send_message(
+                "Verification is unavailable for this account. Contact server staff if you believe this is an error.",
+                ephemeral=True
+            )
+
+        if hsx_has_bypass(gid, uid):
+            hsx_set_status(gid, uid, "bypass")
+            if isinstance(interaction.user, discord.Member):
+                try:
+                    await hsx_apply_roles(interaction.user)
+                except discord.Forbidden:
+                    return await interaction.response.send_message(
+                        "Your bypass is active, but the bot cannot manage the configured roles. Contact staff.",
+                        ephemeral=True
+                    )
+            return await interaction.response.send_message(
+                "Temporary bypass is active. Your roles have been synchronized.",
+                ephemeral=True
+            )
+
+        with hsx_db() as con:
+            con.execute("""
+                INSERT INTO hsx_requests(guild_id,user_id,created_at) VALUES(?,?,?)
+                ON CONFLICT(guild_id,user_id) DO UPDATE SET created_at=excluded.created_at
+            """, (gid, uid, int(time.time())))
+            con.commit()
+
+        await interaction.response.send_message(
+            "Your verification request has been submitted for staff review.",
+            ephemeral=True
+        )
+
+
 _SETTINGS = _load_json(SETTINGS_FILE)
 
 
@@ -1084,6 +1277,14 @@ async def on_member_join(member):
             await modlog(guild, emb("🚨 RAID DETECTED", f"{len(victims)} accounts joined within {RAID_WINDOW}s.\nKicked **{kicked}**. "
                                     f"Raid mode is ON for {RAID_DURATION // 60} minutes (new joins are kicked). Use `raidmode off` to end it.", RED))
             return
+    # HollyScriptX local verification: new members receive the configured pending role.
+    hsx_cfg = hsx_config(guild.id)
+    hsx_pending = guild.get_role(hsx_cfg.get("pending_role_id")) if hsx_cfg.get("pending_role_id") else None
+    if hsx_pending:
+        try:
+            await member.add_roles(hsx_pending, reason="HollyScriptX pending verification")
+        except discord.HTTPException:
+            pass
     if cfg["autorole"]:
         role = guild.get_role(cfg["autorole"])
         if role:
@@ -1148,12 +1349,342 @@ async def help(ctx, name: str = None):
             "🛡️ Security": ["setlog", "automod", "antiraid", "antinuke", "whitelist", "raidmode", "welcome", "autorole", "badword", "config", "prefix"],
             "ℹ️ Utility": ["userinfo", "serverinfo", "avatar", "ping", "say", "poll",
                           "roleinfo", "channelinfo", "remind", "choose", "calc", "invite", "instance"],
-            "🎉 Fun": ["8ball", "coinflip", "roll", "ship", "iq", "ipleak", "bank", "phone", "fakeban", "hack", "rps", "slots", "roast"]}
+            "🎉 Fun": ["8ball", "coinflip", "roll", "ship", "iq", "ipleak", "bank", "phone", "fakeban", "hack", "rps", "slots", "roast"],
+            "HollyScriptX": ["setup", "blacklistadd", "blacklist", "bypass", "feedback", "pull", "rep", "syncroles", "vouch", "verify", "unverify", "requests", "setfeedback"]}
     p = get_cfg(ctx.guild.id)["prefix"] if ctx.guild else DEFAULT_PREFIX
     e = emb("Commands", f"Use `{p}command` or tag me. Use `{p}help <command>` for usage, e.g. `{p}help ban`.")
     for cat, cmds in cats.items():
         e.add_field(name=cat, value=" ".join(f"`{c}`" for c in cmds), inline=False)
     await ctx.send(embed=e)
+
+
+
+# ---------------- HollyScriptX verification commands ----------------
+def hsx_staff():
+    async def predicate(ctx):
+        if not ctx.guild:
+            raise commands.NoPrivateMessage()
+        if ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.manage_guild:
+            return True
+        raise commands.CheckFailure("You need Administrator or Manage Server.")
+    return commands.check(predicate)
+
+
+@bot.command(name="setup", help="setup #verification @Verified [@Pending]")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_setup(ctx, channel: discord.TextChannel, verified_role: discord.Role, pending_role: discord.Role = None):
+    if verified_role.is_default() or verified_role.managed:
+        return await ctx.send("That cannot be used as the Verified role.")
+    if verified_role >= ctx.guild.me.top_role:
+        return await ctx.send("Move the bot role above the Verified role.")
+    if pending_role and (pending_role.is_default() or pending_role.managed or pending_role >= ctx.guild.me.top_role):
+        return await ctx.send("Move the bot role above the Pending role and choose a normal role.")
+
+    with hsx_db() as con:
+        con.execute("""
+            INSERT INTO hsx_config(guild_id,verify_channel_id,verified_role_id,pending_role_id)
+            VALUES(?,?,?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                verify_channel_id=excluded.verify_channel_id,
+                verified_role_id=excluded.verified_role_id,
+                pending_role_id=excluded.pending_role_id
+        """, (ctx.guild.id, channel.id, verified_role.id, pending_role.id if pending_role else None))
+        con.commit()
+
+    embed = emb(
+        "HollyScriptX Verification",
+        "Submit a verification request using the button below. Server staff will review your request.",
+        BLURPLE
+    )
+    await channel.send(embed=embed, view=HollyScriptXVerifyView())
+    await ctx.send(f"Verification panel created in {channel.mention}.")
+
+
+@bot.command(name="setfeedback", help="setfeedback #channel")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_setfeedback(ctx, channel: discord.TextChannel):
+    with hsx_db() as con:
+        con.execute("""
+            INSERT INTO hsx_config(guild_id,feedback_channel_id) VALUES(?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET feedback_channel_id=excluded.feedback_channel_id
+        """, (ctx.guild.id, channel.id))
+        con.commit()
+    await ctx.send(f"Feedback channel set to {channel.mention}.")
+
+
+@bot.command(name="blacklistadd", help="blacklistadd @user [reason]")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_blacklistadd(ctx, user: discord.User, *, reason: str = "No reason provided"):
+    with hsx_db() as con:
+        con.execute("""
+            INSERT INTO hsx_blacklist(guild_id,user_id,reason,added_by,created_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                reason=excluded.reason, added_by=excluded.added_by, created_at=excluded.created_at
+        """, (ctx.guild.id, user.id, reason[:500], ctx.author.id, int(time.time())))
+        con.commit()
+    hsx_set_status(ctx.guild.id, user.id, "blacklisted", ctx.author.id)
+    await ctx.send(f"Added {user} (`{user.id}`) to the verification blacklist.")
+
+
+@bot.group(name="blacklist", invoke_without_command=True, help="blacklist list | blacklist remove @user")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_blacklist(ctx):
+    await ctx.send("Usage: `blacklist list` or `blacklist remove @user`.")
+
+
+@hsx_blacklist.command(name="list")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_blacklist_list(ctx):
+    with hsx_db() as con:
+        rows = con.execute(
+            "SELECT user_id,reason FROM hsx_blacklist WHERE guild_id=? ORDER BY created_at DESC LIMIT 25",
+            (ctx.guild.id,)
+        ).fetchall()
+    if not rows:
+        return await ctx.send("Verification blacklist is empty.")
+    await ctx.send(embed=emb(
+        "Verification blacklist",
+        "\n".join(f"`{r['user_id']}` — {discord.utils.escape_markdown(r['reason'])}" for r in rows),
+        RED
+    ))
+
+
+@hsx_blacklist.command(name="remove")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_blacklist_remove(ctx, user: discord.User):
+    with hsx_db() as con:
+        cur = con.execute(
+            "DELETE FROM hsx_blacklist WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, user.id)
+        )
+        con.commit()
+    if cur.rowcount:
+        if hsx_status(ctx.guild.id, user.id) == "blacklisted":
+            hsx_set_status(ctx.guild.id, user.id, "unverified", ctx.author.id)
+        await ctx.send(f"Removed {user} from the verification blacklist.")
+    else:
+        await ctx.send("That user is not on the verification blacklist.")
+
+
+@bot.group(name="bypass", invoke_without_command=True, help="bypass grant @user 2h | bypass list | bypass revoke @user")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_bypass(ctx):
+    await ctx.send("Usage: `bypass grant @user 2h`, `bypass list`, `bypass revoke @user`.")
+
+
+@hsx_bypass.command(name="grant")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_bypass_grant(ctx, user: discord.User, duration: str):
+    delta = parse_duration(duration)
+    expires = int(time.time() + delta.total_seconds())
+    with hsx_db() as con:
+        con.execute("""
+            INSERT INTO hsx_bypasses(guild_id,user_id,expires_at,granted_by)
+            VALUES(?,?,?,?)
+            ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                expires_at=excluded.expires_at, granted_by=excluded.granted_by
+        """, (ctx.guild.id, user.id, expires, ctx.author.id))
+        con.commit()
+    await ctx.send(f"Temporary bypass granted to {user} until <t:{expires}:F>.")
+
+
+@hsx_bypass.command(name="list")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_bypass_list(ctx):
+    with hsx_db() as con:
+        rows = con.execute(
+            "SELECT user_id,expires_at FROM hsx_bypasses WHERE guild_id=? AND expires_at>? ORDER BY expires_at",
+            (ctx.guild.id, int(time.time()))
+        ).fetchall()
+    if not rows:
+        return await ctx.send("There are no active bypasses.")
+    await ctx.send(embed=emb(
+        "Active verification bypasses",
+        "\n".join(f"`{r['user_id']}` — expires <t:{r['expires_at']}:R>" for r in rows[:25])
+    ))
+
+
+@hsx_bypass.command(name="revoke")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_bypass_revoke(ctx, user: discord.User):
+    with hsx_db() as con:
+        cur = con.execute(
+            "DELETE FROM hsx_bypasses WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, user.id)
+        )
+        con.commit()
+    if cur.rowcount:
+        await ctx.send(f"Bypass revoked for {user}.")
+    else:
+        await ctx.send("No bypass was found for that user.")
+
+
+@bot.command(name="feedback", help="feedback <message>")
+@commands.guild_only()
+async def hsx_feedback(ctx, *, content: str):
+    content = content.strip()
+    if not 3 <= len(content) <= 1500:
+        return await ctx.send("Feedback must be between 3 and 1500 characters.")
+    with hsx_db() as con:
+        con.execute(
+            "INSERT INTO hsx_feedback(guild_id,user_id,content,created_at) VALUES(?,?,?,?)",
+            (ctx.guild.id, ctx.author.id, content, int(time.time()))
+        )
+        con.commit()
+    cfg = hsx_config(ctx.guild.id)
+    channel = ctx.guild.get_channel(cfg.get("feedback_channel_id")) if cfg.get("feedback_channel_id") else None
+    if channel:
+        await channel.send(embed=emb(
+            "New server feedback",
+            f"From: {ctx.author.mention} (`{ctx.author.id}`)\n\n{discord.utils.escape_mentions(content)}",
+            BLURPLE
+        ))
+    await ctx.send("Feedback submitted.")
+
+
+@bot.command(name="pull", help="pull [@user]")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_pull(ctx, user: discord.User = None):
+    target = user or ctx.author
+    status = hsx_status(ctx.guild.id, target.id)
+    bypass_active = hsx_has_bypass(ctx.guild.id, target.id)
+    with hsx_db() as con:
+        req = con.execute(
+            "SELECT created_at FROM hsx_requests WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, target.id)
+        ).fetchone()
+        blocked = con.execute(
+            "SELECT reason FROM hsx_blacklist WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, target.id)
+        ).fetchone()
+    description = (
+        f"User: {target} (`{target.id}`)\n"
+        f"Local status: `{status}`\n"
+        f"Active bypass: `{bypass_active}`\n"
+        f"Pending request: `{bool(req)}`\n"
+        f"Blacklist: `{blocked['reason'] if blocked else 'No'}`\n\n"
+        "External HollyScriptX API/webhook is not configured. This command reads this bot's local records only."
+    )
+    await ctx.send(embed=emb("Verification data", description))
+
+
+@bot.command(name="rep", help="rep")
+@commands.guild_only()
+async def hsx_rep(ctx):
+    with hsx_db() as con:
+        vouches = con.execute(
+            "SELECT COUNT(*) AS n FROM hsx_vouches WHERE guild_id=?", (ctx.guild.id,)
+        ).fetchone()["n"]
+        feedback = con.execute(
+            "SELECT COUNT(*) AS n FROM hsx_feedback WHERE guild_id=?", (ctx.guild.id,)
+        ).fetchone()["n"]
+    # Transparent local metric only, not an official HollyScriptX score.
+    score = min(100, vouches * 5)
+    await ctx.send(embed=emb(
+        "Server reputation — local",
+        f"Vouches: **{vouches}**\nFeedback submissions: **{feedback}**\n"
+        f"Local indicator: **{score}/100**\n\nThis is not an official HollyScriptX trust score."
+    ))
+
+
+@bot.command(name="vouch", help="vouch <message>")
+@commands.guild_only()
+async def hsx_vouch(ctx, *, content: str):
+    content = content.strip()
+    if not 5 <= len(content) <= 500:
+        return await ctx.send("Vouch must be between 5 and 500 characters.")
+    try:
+        with hsx_db() as con:
+            con.execute(
+                "INSERT INTO hsx_vouches(guild_id,user_id,content,created_at) VALUES(?,?,?,?)",
+                (ctx.guild.id, ctx.author.id, content, int(time.time()))
+            )
+            con.commit()
+    except sqlite3.IntegrityError:
+        return await ctx.send("You have already left a vouch for this server.")
+    await ctx.send("Vouch recorded.")
+
+
+@bot.command(name="verify", help="verify @user")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_verify(ctx, member: discord.Member):
+    if hsx_is_blacklisted(ctx.guild.id, member.id):
+        return await ctx.send("This user is blacklisted and cannot be verified.")
+    hsx_set_status(ctx.guild.id, member.id, "verified", ctx.author.id)
+    with hsx_db() as con:
+        con.execute(
+            "DELETE FROM hsx_requests WHERE guild_id=? AND user_id=?",
+            (ctx.guild.id, member.id)
+        )
+        con.commit()
+    try:
+        await hsx_apply_roles(member)
+    except discord.Forbidden:
+        return await ctx.send("Status saved, but I cannot manage the configured roles. Check my role position.")
+    await ctx.send(f"{member.mention} has been marked as verified.")
+
+
+@bot.command(name="unverify", help="unverify @user")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_unverify(ctx, member: discord.Member):
+    hsx_set_status(ctx.guild.id, member.id, "unverified", ctx.author.id)
+    try:
+        await hsx_apply_roles(member)
+    except discord.Forbidden:
+        return await ctx.send("Status saved, but I cannot manage the configured roles. Check my role position.")
+    await ctx.send(f"{member.mention} has been marked as unverified.")
+
+
+@bot.command(name="requests", help="requests")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_requests(ctx):
+    with hsx_db() as con:
+        rows = con.execute(
+            "SELECT user_id,created_at FROM hsx_requests WHERE guild_id=? ORDER BY created_at LIMIT 25",
+            (ctx.guild.id,)
+        ).fetchall()
+    if not rows:
+        return await ctx.send("There are no pending verification requests.")
+    await ctx.send(embed=emb(
+        "Pending verification requests",
+        "\n".join(f"<@{r['user_id']}> (`{r['user_id']}`) — <t:{r['created_at']}:R>" for r in rows)
+    ))
+
+
+@bot.command(name="syncroles", help="syncroles")
+@commands.guild_only()
+@hsx_staff()
+async def hsx_syncroles(ctx):
+    cfg = hsx_config(ctx.guild.id)
+    if not cfg.get("verified_role_id"):
+        return await ctx.send("Run `setup #channel @Verified [@Pending]` first.")
+    await ctx.send("Role synchronization started.")
+    changed = failed = 0
+    for member in ctx.guild.members:
+        before = set(member.roles)
+        try:
+            await hsx_apply_roles(member)
+            if before != set(member.roles):
+                changed += 1
+        except (discord.Forbidden, discord.HTTPException):
+            failed += 1
+    await ctx.send(f"Role synchronization complete. Changed: {changed}. Failed: {failed}.")
+
 
 
 # ---------------- errors ----------------
@@ -1194,10 +1725,13 @@ async def on_message(message):
 @bot.event
 async def setup_hook():
     tempban_loop.start()
+    hsx_init_db()
+    bot.add_view(HollyScriptXVerifyView())
 
 
 @bot.event
 async def on_ready():
+    hsx_init_db()
     print(f"Logged in as {bot.user} | {len(bot.commands)} commands | instance {INSTANCE_ID}", flush=True)
 
 
