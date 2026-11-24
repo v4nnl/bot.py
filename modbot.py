@@ -1734,7 +1734,61 @@ async def setup_hook():
 async def on_ready():
     hsx_init_db()
     print(f"Logged in as {bot.user} | {len(bot.commands)} commands | instance {INSTANCE_ID}", flush=True)
+@bot.event
+async def on_message_delete(message):
+    if not message.guild or message.author.bot:
+        return
+    cfg = get_cfg(message.guild.id)
+    if not cfg.get("log_channel"):
+        return
+    content = (message.content or "*[нет текста / вложение или эмбед]*")[:1000]
+    e = emb(
+        "🗑️ Сообщение удалено",
+        f"**Автор:** {message.author.mention} (`{message.author.id}`)\n"
+        f"**Канал:** {message.channel.mention}\n"
+        f"**Текст:**\n{discord.utils.escape_mentions(content)}",
+        RED,
+    )
+    await modlog(message.guild, e)
 
+
+@bot.event
+async def on_message_edit(before, after):
+    if not after.guild or after.author.bot:
+        return
+    if before.content == after.content:
+        return
+    cfg = get_cfg(after.guild.id)
+    if not cfg.get("log_channel"):
+        return
+    old_txt = (before.content or "*[пусто]*")[:900]
+    new_txt = (after.content or "*[пусто]*")[:900]
+    e = emb(
+        "✏️ Сообщение изменено",
+        f"**Автор:** {after.author.mention} (`{after.author.id}`)\n"
+        f"**Канал:** {after.channel.mention} ([перейти]({after.jump_url}))\n"
+        f"**Было:**\n{discord.utils.escape_mentions(old_txt)}\n\n"
+        f"**Стало:**\n{discord.utils.escape_mentions(new_txt)}",
+        GOLD,
+    )
+    await modlog(after.guild, e)
+
+
+@bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    cfg = get_cfg(guild.id)
+    if not cfg.get("log_channel"):
+        return
+    roles = [r.mention for r in member.roles if r != guild.default_role]
+    roles_txt = ", ".join(roles[:15]) if roles else "нет"
+    e = emb(
+        "🚪 Участник вышел / удалён",
+        f"**Пользователь:** {member} (`{member.id}`)\n"
+        f"**Роли:** {roles_txt}",
+        BLURPLE,
+    )
+    await modlog(guild, e)
 
 if __name__ == "__main__":
     import sys
