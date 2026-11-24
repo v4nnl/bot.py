@@ -13,6 +13,7 @@ import random
 import re
 import socket
 import time
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Union
